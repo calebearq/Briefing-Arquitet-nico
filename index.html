@@ -694,6 +694,9 @@ const state = {
   storageFailDetail: '',
   sheetFetchStatus: 'idle', // idle | loading | ok | fail
   sheetFetchError: '',
+  importOpen: false,
+  importMsg: '',
+  importMsgOk: true,
 
   // editor
   editorDraft: null,
@@ -1070,6 +1073,98 @@ function sheetBannerHtml(){
   '</div>';
 }
 
+function renderImportPanel(){
+  const open = !!state.importOpen;
+  return '<div class="editor-sheet'+(open?' open':'')+'" style="margin-bottom:1.6em;">' +
+    '<div class="es-head" data-act="admin-toggle-import">' +
+      '<span class="eyebrow">Importar</span>' +
+      '<span style="flex:1;font-family:\'Bodoni Moda\',serif;font-size:1.05rem;">Importar respostas (.json) recebidas por e-mail</span>' +
+      '<span class="chevron">›</span>' +
+    '</div>' +
+    '<div class="es-body">' +
+      '<p class="sheet-help" style="margin-top:0;">Abra o e-mail com a resposta do cliente, copie todo o conteúdo (o texto começando com <code>{</code>) e cole abaixo — ou selecione um ou mais arquivos .json baixados do e-mail.</p>' +
+      '<div class="field-label">Colar o conteúdo do e-mail</div>' +
+      '<textarea class="textarea-input" id="import-paste-area" style="min-height:8em;font-family:monospace;font-size:.78rem;" placeholder="{ &quot;id&quot;: ... }"></textarea>' +
+      '<div style="margin-top:.7em;display:flex;gap:.7em;flex-wrap:wrap;align-items:center;">' +
+        '<button type="button" class="btn btn-sm" data-act="admin-import-paste">Importar texto colado</button>' +
+        '<label class="btn-ghost btn btn-sm" style="cursor:pointer;">Selecionar arquivo(s) .json<input type="file" id="import-file-input" accept=".json,application/json" multiple style="display:none;"></label>' +
+      '</div>' +
+      (state.importMsg ? '<div class="nav-error" style="margin-top:.7em;color:'+(state.importMsgOk?'var(--ok)':'var(--err)')+';">'+escapeHtml(state.importMsg)+'</div>' : '') +
+      '<p class="sheet-help">As respostas importadas ficam disponíveis nesta aba enquanto ela estiver aberta. Para manter tudo reunido depois de fechar, use "Baixar tudo em .json" e guarde o arquivo — na próxima vez, importe esse mesmo arquivo de volta.</p>' +
+    '</div>' +
+  '</div>';
+}
+
+function mergeSubmissions(newOnes){
+  const existing = state.submissions || [];
+  const byId = {};
+  existing.forEach(function(s){ if(s && s.id) byId[s.id] = s; });
+  let added = 0, updated = 0, invalid = 0;
+  newOnes.forEach(function(s){
+    if(!s || typeof s !== 'object' || !s.cliente && !s.respostas){ invalid++; return; }
+    if(!s.id) s.id = uid('sub');
+    if(byId[s.id]) updated++; else added++;
+    byId[s.id] = s;
+  });
+  state.submissions = Object.keys(byId).map(function(k){ return byId[k]; })
+    .sort(function(a,b){ return new Date(b.enviadoEm||0) - new Date(a.enviadoEm||0); });
+  return {added:added, updated:updated, invalid:invalid};
+}
+function parseImportedJson(text){
+  let data;
+  try{ data = JSON.parse(text); }catch(e){ return {ok:false, error:'JSON inválido — confira se copiou o conteúdo completo do e-mail.'}; }
+  const arr = Array.isArray(data) ? data : [data];
+  const res = mergeSubmissions(arr);
+  if(res.added===0 && res.updated===0){ return {ok:false, error:'Nada reconhecível encontrado nesse conteúdo.'}; }
+  return {ok:true, res:res};
+}
+function importFromPasteBox(){
+  const el = document.getElementById('import-paste-area');
+  const text = el ? el.value.trim() : '';
+  if(!text){ state.importMsg = 'Cole o conteúdo do e-mail antes de importar.'; state.importMsgOk = false; render(); return; }
+  const result = parseImportedJson(text);
+  if(result.ok){
+    state.importMsg = (result.res.added) + ' nova(s), ' + (result.res.updated) + ' atualizada(s).';
+    state.importMsgOk = true;
+    state.sheetFetchStatus = 'ok';
+    if(el) el.value = '';
+  } else {
+    state.importMsg = result.error;
+    state.importMsgOk = false;
+  }
+  render();
+}
+function importFromFiles(fileList){
+  const files = Array.from(fileList || []);
+  if(!files.length) return;
+  let pending = files.length;
+  let totalAdded = 0, totalUpdated = 0, totalInvalid = 0, anyError = false;
+  files.forEach(function(file){
+    const reader = new FileReader();
+    reader.onload = function(){
+      const result = parseImportedJson(String(reader.result||''));
+      if(result.ok){
+        totalAdded += result.res.added; totalUpdated += result.res.updated; totalInvalid += result.res.invalid;
+      } else { anyError = true; }
+      pending--;
+      if(pending===0){
+        state.importMsg = anyError ?
+          ('Alguns arquivos não puderam ser lidos. ' + totalAdded + ' nova(s), ' + totalUpdated + ' atualizada(s).') :
+          (totalAdded + ' nova(s), ' + totalUpdated + ' atualizada(s).');
+        state.importMsgOk = !anyError || (totalAdded+totalUpdated) > 0;
+        state.sheetFetchStatus = 'ok';
+        render();
+      }
+    };
+    reader.onerror = function(){
+      pending--;
+      anyError = true;
+      if(pending===0){ state.importMsg = 'Não foi possível ler um ou mais arquivos.'; state.importMsgOk = false; render(); }
+    };
+    reader.readAsText(file);
+  });
+}
+
 function renderAdminDashboard(){
   const subs = state.submissions || [];
   const filter = state.subFilter.trim().toLowerCase();
@@ -1083,7 +1178,7 @@ function renderAdminDashboard(){
   if(state.sheetFetchStatus === 'loading'){
     listHtml = '<div class="empty-state">Carregando respostas…</div>';
   } else if(!subs.length){
-    listHtml = '<div class="empty-state"><div class="es-icon">'+iconSvg('flatRoof')+'</div><div>Nenhum briefing recebido ainda.<br>Envie o link do site para seus clientes — cada resposta também chega por e-mail automaticamente.</div></div>';
+    listHtml = '<div class="empty-state"><div class="es-icon">'+iconSvg('flatRoof')+'</div><div>Nenhum briefing carregado ainda.<br>Use "Importar respostas (.json)" acima para carregar as respostas que chegaram por e-mail.</div></div>';
   } else if(!filtered.length){
     listHtml = '<div class="empty-state">Nenhum resultado para "'+escapeHtml(state.subFilter)+'".</div>';
   } else {
@@ -1101,6 +1196,7 @@ function renderAdminDashboard(){
   return adminTopbar('dashboard') + '<div class="admin-body">' +
     sheetBannerHtml() +
     '<div class="sheet-head" style="margin-bottom:1.2em;"><div class="eyebrow">Área do arquiteto</div><h2 class="display">Briefings recebidos</h2></div>' +
+    renderImportPanel() +
     '<div class="toolbar">' +
       '<input type="text" class="text-input" placeholder="Buscar por cliente ou tipo de projeto…" data-field="sub-filter" value="'+escapeHtml(state.subFilter)+'">' +
       '<span class="count-pill">'+filtered.length+' de '+subs.length+' resposta(s)</span>' +
@@ -1485,7 +1581,9 @@ function buildMailSubject(sub){
   return 'Briefing de projeto — ' + name;
 }
 function buildMailBody(sub){
-  return submissionToText(sub);
+  const intro = 'Resposta de ' + ((sub.meta && sub.meta.clientName) || 'cliente') + '.\n' +
+    'Cole este JSON na Área do arquiteto → "Importar respostas (.json)" para visualizar.\n\n';
+  return intro + JSON.stringify(buildSheetPayload(sub), null, 2);
 }
 function buildMailtoHref(sub){
   const subject = encodeURIComponent(buildMailSubject(sub));
@@ -1575,15 +1673,15 @@ async function fetchSheetSubmissions(){
 }
 async function goAdminDashboard(){
   state.screen = 'admin-dashboard';
-  state.submissions = null;
+  const already = state.submissions || [];
   state.sheetFetchStatus = 'loading';
   render();
   const res = await fetchSheetSubmissions();
+  state.submissions = already; // preserva o que já foi importado manualmente
   if(res.ok){
-    state.submissions = res.rows;
+    mergeSubmissions(res.rows);
     state.sheetFetchStatus = 'ok';
   } else {
-    state.submissions = [];
     state.sheetFetchStatus = 'fail';
     state.sheetFetchError = res.error;
   }
@@ -1724,6 +1822,11 @@ document.addEventListener('click', function(e){
     return;
   }
   if(act === 'admin-print'){ window.print(); return; }
+  if(act === 'admin-toggle-import'){
+    state.importOpen = !state.importOpen;
+    render(); return;
+  }
+  if(act === 'admin-import-paste'){ importFromPasteBox(); return; }
 
   if(act === 'editor-toggle-sheet'){
     const sid = t.getAttribute('data-sheet');
@@ -1830,6 +1933,10 @@ document.addEventListener('input', function(e){
 
 document.addEventListener('change', function(e){
   const el = e.target;
+  if(el.id === 'import-file-input'){
+    importFromFiles(el.files);
+    return;
+  }
   if(el.matches('[data-editor-label]')){
     editorUpdateQuestionField(el.getAttribute('data-editor-label'), 'label', el.value);
   } else if(el.matches('[data-editor-type]')){
