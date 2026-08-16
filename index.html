@@ -550,6 +550,11 @@ const ARCHITECT_EMAIL = 'calebeas@gmail.com';
    conta do cliente. Melhor esforço: roda em paralelo ao e-mail garantido,
    nunca bloqueia o envio se falhar. */
 const SHEET_WEBAPP_URL = 'https://script.google.com/macros/s/AKfycbwXzNNPzmie995UcBYdSim1PJf6m4EB5lCyZnOB2R8WVtkH28bPyHpimr7lZC1SUdvw/exec';
+/* Senha fixa da Área do Arquiteto — funciona em qualquer hospedagem (GitHub
+   Pages incluso), pois não depende do armazenamento da Claude. O MESMO valor
+   precisa estar configurado como ADMIN_TOKEN no Apps Script (Code.gs), pois
+   é ele que autentica o pedido dos dados na planilha. */
+const ADMIN_PASSCODE = 'CA-Arquiteto-2026';
 
 /* Fotos reais extraídas do briefing em PDF original (perguntas de estilo,
    fachada e revestimentos) — substituem os ícones/amostras vetorizados. */
@@ -687,6 +692,8 @@ const state = {
   selectedSub: null,
   storageStatus: 'unknown', // unknown | checking | ok | fail
   storageFailDetail: '',
+  sheetFetchStatus: 'idle', // idle | loading | ok | fail
+  sheetFetchError: '',
 
   // editor
   editorDraft: null,
@@ -1026,19 +1033,13 @@ function renderClientSuccess(){
    Tela: Portão do arquiteto (senha)
 --------------------------------------------------------- */
 function renderAdminGate(){
-  const creating = state.passcodeExists === false;
   return '<div class="admin-gate-wrap"><div class="admin-gate-card">' +
-    storageBannerHtml() +
     '<img class="aw" src="'+LOGO_WORDMARK+'" alt="">' +
-    (creating ?
-      '<h2 class="display">Defina sua senha</h2><p>Esta é a primeira vez aqui. Crie uma senha de acesso à área do arquiteto — só você (com essa senha) verá as respostas dos clientes.</p>' :
-      '<h2 class="display">Área do arquiteto</h2><p>Digite sua senha de acesso para ver os briefings recebidos.</p>'
-    ) +
+    '<h2 class="display">Área do arquiteto</h2><p>Digite sua senha de acesso para ver os briefings recebidos.</p>' +
     '<form data-form="admin-pass">' +
-      '<input type="password" class="text-input" name="pass1" placeholder="'+(creating?'Nova senha':'Senha')+'" autocomplete="off" value="'+escapeHtml(state.passInput)+'">' +
-      (creating ? '<input type="password" class="text-input" name="pass2" placeholder="Confirme a senha" autocomplete="off" value="'+escapeHtml(state.passInput2)+'">' : '') +
+      '<input type="password" class="text-input" name="pass1" placeholder="Senha" autocomplete="off" value="'+escapeHtml(state.passInput)+'">' +
       (state.passError ? '<div class="nav-error" style="text-align:left;">'+escapeHtml(state.passError)+'</div>' : '') +
-      '<button type="submit" class="btn">'+(creating?'Criar senha e entrar':'Entrar')+'</button>' +
+      '<button type="submit" class="btn">Entrar</button>' +
     '</form>' +
     '<div style="margin-top:1.6em;"><button type="button" class="btn-text" data-act="back-landing">Voltar ao início</button></div>' +
   '</div></div>';
@@ -1057,38 +1058,53 @@ function adminTopbar(activeLabel){
   '</div>';
 }
 
+function sheetBannerHtml(){
+  if(state.sheetFetchStatus === 'ok' || state.sheetFetchStatus === 'idle' || state.sheetFetchStatus === 'loading') return '';
+  return '<div class="storage-banner fail">' +
+    '<strong>Não consegui carregar as respostas da planilha agora.</strong> ' +
+    'Confira: (1) a senha digitada é exatamente a mesma configurada como ADMIN_TOKEN no Apps Script; ' +
+    '(2) o Apps Script está implantado com "Quem pode acessar: Qualquer pessoa"; ' +
+    '(3) a URL da planilha configurada no site está correta e ativa.' +
+    (state.sheetFetchError ? ('<div class="sb-detail">Mensagem técnica: '+escapeHtml(state.sheetFetchError)+'</div>') : '') +
+    '<div style="margin-top:.7em;"><button type="button" class="btn-ghost btn btn-sm" data-act="admin-go-dashboard">Tentar novamente</button></div>' +
+  '</div>';
+}
+
 function renderAdminDashboard(){
   const subs = state.submissions || [];
   const filter = state.subFilter.trim().toLowerCase();
   const filtered = filter ? subs.filter(function(s){
-    const name = (s.meta && s.meta.clientName || '').toLowerCase();
-    const proj = (s.meta && s.meta.projectType || '').toLowerCase();
+    const name = (s.cliente || '').toLowerCase();
+    const proj = (s.tipoProjeto || '').toLowerCase();
     return name.includes(filter) || proj.includes(filter);
   }) : subs;
 
   let listHtml;
-  if(!subs.length){
-    listHtml = '<div class="empty-state"><div class="es-icon">'+iconSvg('flatRoof')+'</div><div>Nenhum briefing recebido aqui ainda.<br>Envie o link do site para seus clientes — cada resposta também chega por e-mail, mesmo que não apareça nesta lista.</div></div>';
+  if(state.sheetFetchStatus === 'loading'){
+    listHtml = '<div class="empty-state">Carregando respostas…</div>';
+  } else if(!subs.length){
+    listHtml = '<div class="empty-state"><div class="es-icon">'+iconSvg('flatRoof')+'</div><div>Nenhum briefing recebido ainda.<br>Envie o link do site para seus clientes — cada resposta também chega por e-mail automaticamente.</div></div>';
   } else if(!filtered.length){
     listHtml = '<div class="empty-state">Nenhum resultado para "'+escapeHtml(state.subFilter)+'".</div>';
   } else {
     listHtml = filtered.map(function(s){
-      const name = (s.meta && s.meta.clientName) || 'Sem nome';
-      const proj = (s.meta && s.meta.projectType) || '—';
+      const name = s.cliente || 'Sem nome';
+      const proj = s.tipoProjeto || '—';
       return '<div class="sub-row">' +
         '<div class="sr-name">'+escapeHtml(name)+'<span class="sr-sub">'+escapeHtml(proj)+'</span></div>' +
-        '<div class="sr-date">'+formatDate(s.createdAt)+'</div>' +
+        '<div class="sr-date">'+formatDate(new Date(s.enviadoEm).getTime())+'</div>' +
         '<button type="button" class="btn-ghost btn btn-sm" data-act="admin-view-sub" data-subid="'+s.id+'">Ver respostas</button>' +
       '</div>';
     }).join('');
   }
 
   return adminTopbar('dashboard') + '<div class="admin-body">' +
-    storageBannerHtml() +
+    sheetBannerHtml() +
     '<div class="sheet-head" style="margin-bottom:1.2em;"><div class="eyebrow">Área do arquiteto</div><h2 class="display">Briefings recebidos</h2></div>' +
     '<div class="toolbar">' +
       '<input type="text" class="text-input" placeholder="Buscar por cliente ou tipo de projeto…" data-field="sub-filter" value="'+escapeHtml(state.subFilter)+'">' +
       '<span class="count-pill">'+filtered.length+' de '+subs.length+' resposta(s)</span>' +
+      (subs.length ? '<button type="button" class="btn-ghost btn btn-sm" data-act="admin-download-all">Baixar tudo em .json</button>' : '') +
     '</div>' +
     listHtml +
   '</div>';
@@ -1100,27 +1116,24 @@ function renderAdminDashboard(){
 function renderAdminDetail(){
   const sub = state.selectedSub;
   if(!sub) return adminTopbar('dashboard') + '<div class="admin-body">Resposta não encontrada. <button class="btn-text" data-act="admin-go-dashboard">Voltar</button></div>';
-  const schema = sub.schemaSnapshot;
-  const name = (sub.meta && sub.meta.clientName) || 'Sem nome';
-  const proj = (sub.meta && sub.meta.projectType) || '—';
+  const name = sub.cliente || 'Sem nome';
+  const proj = sub.tipoProjeto || '—';
 
-  const sheetsHtml = schema.sheets.map(function(sheet){
-    const items = sheet.questions.map(function(qid){
-      const question = schema.questions[qid];
-      if(!question) return '';
-      const val = sub.answers[qid];
-      const text = formatAnswerDisplay(question, val);
-      return '<div class="review-item"><div class="ri-q">'+escapeHtml(question.label)+'</div><div class="ri-a'+(text?'':' empty')+'">'+(text?nl2br(text):'Não respondido')+'</div></div>';
+  const sheetsHtml = groupByPrancha(sub.respostas).map(function(g){
+    const items = g.itens.map(function(item){
+      const text = item.resposta || '';
+      return '<div class="review-item"><div class="ri-q">'+escapeHtml(item.pergunta)+'</div><div class="ri-a'+(text?'':' empty')+'">'+(text?nl2br(text):'Não respondido')+'</div></div>';
     }).join('');
-    return '<div class="review-sheet"><div class="rs-head"><h3>'+sheet.eyebrow+' — '+escapeHtml(sheet.title)+'</h3></div>'+items+'</div>';
+    return '<div class="review-sheet"><div class="rs-head"><h3>'+escapeHtml(g.prancha)+'</h3></div>'+items+'</div>';
   }).join('');
 
   return adminTopbar('dashboard') + '<div class="admin-body">' +
     '<button type="button" class="btn-text" data-act="admin-go-dashboard" style="margin-bottom:1.6em;">← Todas as respostas</button>' +
     '<div class="detail-head">' +
-      '<div><h2 class="display">'+escapeHtml(name)+'</h2><div class="dh-meta">'+escapeHtml(proj)+' · Enviado em '+formatDate(sub.createdAt)+'</div></div>' +
+      '<div><h2 class="display">'+escapeHtml(name)+'</h2><div class="dh-meta">'+escapeHtml(proj)+' · Enviado em '+formatDate(new Date(sub.enviadoEm).getTime())+'</div></div>' +
       '<div class="detail-actions">' +
         '<button type="button" class="btn-ghost btn btn-sm" data-act="admin-copy-sub" data-subid="'+sub.id+'">Copiar respostas</button>' +
+        '<button type="button" class="btn-ghost btn btn-sm" data-act="admin-download-sub" data-subid="'+sub.id+'">Baixar .json</button>' +
         '<button type="button" class="btn-ghost btn btn-sm" data-act="admin-print">Imprimir / salvar PDF</button>' +
       '</div>' +
     '</div>' +
@@ -1500,48 +1513,87 @@ async function runStorageCheck(){
 async function enterAdminGate(){
   state.screen = 'admin-gate';
   state.passError = '';
-  state.passInput = ''; state.passInput2 = '';
-  render();
-  runStorageCheck();
-  const pass = await loadPasscodeRemote();
-  state.passcodeExists = !!pass;
+  state.passInput = '';
   render();
 }
-async function handleAdminPassSubmit(pass1, pass2){
-  const creating = state.passcodeExists === false;
-  if(creating){
-    if(!pass1 || pass1.length < 4){ state.passError = 'Use uma senha com pelo menos 4 caracteres.'; render(); return; }
-    if(pass1 !== pass2){ state.passError = 'As senhas não coincidem.'; render(); return; }
-    const saved = await savePasscodeRemote(pass1);
-    if(!saved){
-      state.passError = 'Não foi possível salvar a senha agora — o armazenamento deste site não está respondendo (veja o aviso abaixo). Publique o artifact e tente de novo.';
-      await runStorageCheck();
-      return;
-    }
+async function handleAdminPassSubmit(pass1){
+  if(pass1 === ADMIN_PASSCODE){
     state.adminAuthed = true;
     await goAdminDashboard();
   } else {
-    const real = await loadPasscodeRemote();
-    if(pass1 === real){
-      state.adminAuthed = true;
-      await goAdminDashboard();
-    } else {
-      state.passError = 'Senha incorreta.';
-      render();
-    }
+    state.passError = 'Senha incorreta.';
+    render();
+  }
+}
+function groupByPrancha(respostas){
+  const order = [];
+  const map = {};
+  (respostas||[]).forEach(function(item){
+    const key = item.prancha || 'Respostas';
+    if(!map[key]){ map[key] = []; order.push(key); }
+    map[key].push(item);
+  });
+  return order.map(function(key){ return {prancha:key, itens:map[key]}; });
+}
+function sheetRowToText(row){
+  const name = row.cliente || 'Sem nome';
+  const proj = row.tipoProjeto || '—';
+  let out = 'BRIEFING DE PROJETO — ' + name + '\n' + proj + ' · ' + formatDate(new Date(row.enviadoEm).getTime()) + '\n';
+  groupByPrancha(row.respostas).forEach(function(g){
+    out += '\n' + g.prancha + '\n';
+    g.itens.forEach(function(item){
+      out += '- ' + item.pergunta + ': ' + (item.resposta || 'Não respondido') + '\n';
+    });
+  });
+  return out;
+}
+function downloadJsonFile(filename, dataObj){
+  try{
+    const blob = new Blob([JSON.stringify(dataObj, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
+    return true;
+  }catch(e){ return false; }
+}
+async function fetchSheetSubmissions(){
+  if(!SHEET_WEBAPP_URL){ return {ok:false, error:'URL da planilha não configurada.'}; }
+  try{
+    const sep = SHEET_WEBAPP_URL.indexOf('?') > -1 ? '&' : '?';
+    const url = SHEET_WEBAPP_URL + sep + 'token=' + encodeURIComponent(ADMIN_PASSCODE);
+    const res = await fetch(url, {method:'GET'});
+    if(!res.ok){ return {ok:false, error:'HTTP ' + res.status}; }
+    const data = await res.json();
+    if(data && data.error){ return {ok:false, error:data.error}; }
+    if(!Array.isArray(data)){ return {ok:false, error:'Resposta inesperada do servidor.'}; }
+    return {ok:true, rows:data};
+  }catch(e){
+    return {ok:false, error:(e && e.message) ? e.message : String(e)};
   }
 }
 async function goAdminDashboard(){
   state.screen = 'admin-dashboard';
   state.submissions = null;
+  state.sheetFetchStatus = 'loading';
   render();
-  state.submissions = await listSubmissionsRemote();
+  const res = await fetchSheetSubmissions();
+  if(res.ok){
+    state.submissions = res.rows;
+    state.sheetFetchStatus = 'ok';
+  } else {
+    state.submissions = [];
+    state.sheetFetchStatus = 'fail';
+    state.sheetFetchError = res.error;
+  }
   render();
 }
 async function goAdminEditor(){
   state.editorDraft = cloneDeep(state.schema);
   state.screen = 'admin-editor';
   render();
+  runStorageCheck();
 }
 function adminLogout(){
   state.adminAuthed = false;
@@ -1555,15 +1607,15 @@ function adminLogout(){
 function storageBannerHtml(){
   if(state.storageStatus === 'ok' || state.storageStatus === 'unknown') return '';
   if(state.storageStatus === 'checking'){
-    return '<div class="storage-banner checking">Verificando conexão com o armazenamento…</div>';
+    return '<div class="storage-banner checking">Verificando se é possível salvar alterações nas perguntas…</div>';
   }
   return '<div class="storage-banner fail">' +
-    '<strong>O painel de respostas não está conseguindo salvar/ler dados agora.</strong> ' +
-    'Isso não afeta os briefings dos clientes — eles chegam por e-mail normalmente. Mas para o painel funcionar, confira: ' +
-    '<br>1) O artifact precisa estar <strong>Publicado</strong> (botão "Publish") — o armazenamento só funciona em artifacts publicados.' +
+    '<strong>Não é possível salvar alterações nas perguntas neste momento.</strong> ' +
+    'Isso não afeta os clientes nem as respostas recebidas — só a edição das perguntas por aqui. Este recurso funciona apenas quando o site está rodando dentro do ambiente da Claude (não funciona em hospedagens externas como GitHub Pages). Se você está dentro da Claude, confira: ' +
+    '<br>1) O artifact precisa estar <strong>Publicado</strong> (botão "Publish").' +
     '<br>2) "Code execution and file creation" precisa estar ativo em Configurações → Capabilities.' +
-    '<br>3) O armazenamento persistente é um recurso dos planos <strong>Pro, Max, Team ou Enterprise</strong> — não existe no plano Free.' +
-    '<br>4) Se os três itens acima já estão certos, pode ser uma instabilidade momentânea do servidor da Anthropic — tente de novo em alguns minutos.' +
+    '<br>3) É um recurso dos planos <strong>Pro, Max, Team ou Enterprise</strong> — não existe no plano Free.' +
+    '<br>Se o site está publicado fora da Claude (ex: GitHub Pages), peça para a Claude atualizar as perguntas diretamente no arquivo — é o caminho confiável nesse caso.' +
     (state.storageFailDetail ? ('<div class="sb-detail">Mensagem técnica recebida: '+escapeHtml(state.storageFailDetail)+'</div>') : '') +
     '<div style="margin-top:.7em;"><button type="button" class="btn-ghost btn btn-sm" data-act="admin-check-storage">Testar novamente</button></div>' +
   '</div>';
@@ -1651,11 +1703,24 @@ document.addEventListener('click', function(e){
   if(act === 'admin-copy-sub'){
     const sub = state.selectedSub;
     if(sub){
-      const text = submissionToText(sub);
+      const text = sheetRowToText(sub);
       if(navigator.clipboard && navigator.clipboard.writeText){
         navigator.clipboard.writeText(text).then(function(){ showToast('Respostas copiadas.'); }).catch(function(){ showToast('Não foi possível copiar.'); });
       }
     }
+    return;
+  }
+  if(act === 'admin-download-sub'){
+    const sub = state.selectedSub;
+    if(sub){
+      const ok = downloadJsonFile('briefing-' + (sub.cliente || 'cliente').toLowerCase().replace(/[^a-z0-9]+/g,'-') + '.json', sub);
+      showToast(ok ? 'Download iniciado.' : 'Não foi possível baixar.');
+    }
+    return;
+  }
+  if(act === 'admin-download-all'){
+    const ok = downloadJsonFile('briefings-recebidos.json', state.submissions || []);
+    showToast(ok ? 'Download iniciado.' : 'Não foi possível baixar.');
     return;
   }
   if(act === 'admin-print'){ window.print(); return; }
@@ -1791,9 +1856,7 @@ document.addEventListener('submit', function(e){
   if(form){
     e.preventDefault();
     const pass1 = form.querySelector('[name="pass1"]').value;
-    const pass2Input = form.querySelector('[name="pass2"]');
-    const pass2 = pass2Input ? pass2Input.value : '';
-    handleAdminPassSubmit(pass1, pass2);
+    handleAdminPassSubmit(pass1);
   }
 });
 
